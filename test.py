@@ -35,6 +35,7 @@ parser.add_argument("--angular_in", type=int, default=2, help="angular number of
 parser.add_argument("--test_dataset", type=str, default="30Scenes", help="dataset for testing") #30Scenes, occlusions, reflective
 parser.add_argument("--data_path", type=str, default="./TestData/test_30Scenes.h5",help="file path contained the dataset for testing")
 parser.add_argument("--save_img", type=int, default=1,help="save image or not")
+parser.add_argument("--crop", type=int, default=1, help="crop the image into patches when out of memory")
 opt = parser.parse_args()
 print(opt)
 
@@ -105,6 +106,30 @@ def ycbcr2rgb(ycbcr):
     rgb = np.dot(rgb, np.linalg.inv(m.transpose()) * 255.)
     return rgb.clip(0, 1).reshape(shape).astype(np.float32)
 
+def CropPatches_w(image,len,crop):
+    #image [1,4,ph,pw]
+    #left [1,4,h,lw]
+    #middles[n,4,h,mw]
+    #right [1,4,h,rw]
+    an,h,w = image.shape[1:4]
+    left = image[:,:,:,0:len+crop]
+    num = math.floor((w-len-crop)/len)
+    middles = torch.Tensor(num,an,h,len+crop*2).to(image.device)
+    for i in range(num):
+        middles[i] = image[0,:,:,(i+1)*len-crop:(i+2)*len+crop]
+    right = image[:,:,:,-(len+crop):]
+    return left,middles,right
+
+def MergePatches_w(left,middles,right,h,w,len,crop):
+    #[N,4,h,w]
+    n,a = left.shape[0:2]
+    out = torch.Tensor(n,a,h,w).to(left.device)
+    out[:,:,:,:len] = left[:,:,:,:-crop]
+    for i in range(middles.shape[0]):
+        out[:,:,:,len*(i+1):len*(i+2)] = middles[i:i+1,:,:,crop:-crop]
+    out[:,:,:,-len:]=right[:,:,:,crop:]
+    return out
+
 def compt_psnr(img1, img2):
     bd=22
     mse = np.mean( (img1[bd:-bd, bd:-bd] - img2[bd:-bd, bd:-bd]) ** 2 )
@@ -158,7 +183,18 @@ def test():
             # Network
             ind_source, inputs, lfi_ycbcr = batch[0], batch[1], batch[2]
             inputs = inputs[:,:,:,:,0].to(device)
-            out = model(inputs, opt)
+            if not opt.crop:
+                out = model_view(inputs, opt)
+            else:
+                length = 50
+                crop = 10
+                input_l, input_m, input_r = CropPatches_w(inputs, length, crop)
+                pred_l = model_view(input_l, opt)
+                pred_m = torch.Tensor(input_m.shape[0], opt.angular_out * opt.angular_out, input_m.shape[2], input_m.shape[3])
+                for i in range(input_m.shape[0]):
+                    pred_m[i:i + 1] = model_view(input_m[i:i + 1], opt)
+                pred_r = model_view(input_r, opt)
+                out = MergePatches_w(pred_l, pred_m, pred_r, inputs.shape[2], inputs.shape[3], length, crop)
 
             # # for visualization
             _, d, h, w = out.shape
